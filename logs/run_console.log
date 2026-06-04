@@ -1,0 +1,56 @@
+[INFO] Project root:
+D:\College\Capstone_Project\testing_code
+
+[INFO] Checking laptop dependencies...
+[TEST 1] Checking conda...
+[OK] conda found.
+[TEST 2] Checking conda environment: yolo_cam
+[OK] Conda environment exists: yolo_cam
+[TEST 3] Installing laptop dependencies...
+[INFO] Installing from requirements-laptop.txt
+[TEST 4] Verifying Python imports...
+[OK] Python imports are ready.
+[TEST 5] Checking project files...
+[OK] Required project files exist.
+[OK] Dependency check passed.
+[INFO] Log saved to logs\dependency_check.log
+
+[INFO] Dependency check passed.
+
+[INFO] Starting connection test...
+[TEST 1] Windows to Raspberry Pi ping
+[OK] Raspberry Pi ping success.
+[TEST 2] SSH connection test
+[OK] SSH connection success.
+[TEST 3] Raspberry Pi project file check
+[OK] Raspberry Pi project files exist.
+[TEST 4] Raspberry Pi Python package check
+[OK] Raspberry Pi Python packages are ready.
+[OK] Connection test passed.
+[INFO] Log saved to logs\connection_test.log
+
+[INFO] Connection test passed.
+
+[INFO] Starting Raspberry Pi camera and motor server...
+[1/5] Checking SSH key...
+SSH key already exists.
+[2/5] Installing public key to Raspberry Pi...
+If this is the first time on this computer, enter Raspberry Pi password once.
+[3/5] Testing SSH connection...
+SSH key login success
+[4/5] Killing old project processes...
+old processes killed
+[5/5] Starting camera and motor server in background...
+started
+5814 bash -c mkdir -p /home/fl/testing_code/logs; cd /home/fl/testing_code; nohup /usr/bin/python3 /home/fl/testing_code/scripts/pi_camera2_pub.py > /home/fl/testing_code/logs/pi_camera2_pub.log 2>&1 & nohup /usr/bin/python3 /home/fl/testing_code/scripts/motor_zmq_server.py > /home/fl/testing_code/logs/motor_zmq_server.log 2>&1 & sleep 2; echo started; pgrep -af '[p]i_camera2_pub.py'; pgrep -af '[m]otor_zmq_server.py'
+5816 /usr/bin/python3 /home/fl/testing_code/scripts/pi_camera2_pub.py
+5817 /usr/bin/python3 /home/fl/testing_code/scripts/motor_zmq_server.py
+Done.
+
+[INFO] Starting laptop UI program...
+[INFO] Camera: tcp://192.168.24.50:5556
+[INFO] Motor : tcp://192.168.24.50:5555
+
+[INFO] UI closed. Stopping Raspberry Pi camera and motor server...
+[INFO] Cleanup complete.
+계속하려면 아무 키나 누르십시오 . . . 

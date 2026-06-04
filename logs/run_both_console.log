@@ -1,0 +1,54 @@
+[INFO] Project root:
+D:\College\Capstone_Project\testing_code
+
+[INFO] Checking SSH key...
+[OK] SSH key already exists.
+
+[INFO] Checking laptop dependencies...
+[TEST 1] Checking conda...
+[OK] conda found.
+[TEST 2] Checking conda environment: yolo_cam
+[OK] Conda environment exists: yolo_cam
+[TEST 3] Installing laptop dependencies...
+[INFO] Installing from requirements-laptop.txt
+[TEST 4] Verifying Python imports...
+[OK] Python imports are ready.
+[TEST 5] Checking project files...
+[OK] Required project files exist.
+[OK] Dependency check passed.
+[INFO] Log saved to logs\dependency_check.log
+
+[INFO] Checking Clean Car connection: 192.168.24.50
+[TEST] Ping clean_car: 192.168.24.50
+[OK] Ping success: clean_car
+
+[TEST] SSH key login test: clean_car
+[OK] SSH key login success: clean_car
+
+[INFO] Checking Backdoor Car connection: 192.168.24.60
+[TEST] Ping backdoor_car: 192.168.24.60
+[OK] Ping success: backdoor_car
+
+[TEST] SSH key login test: backdoor_car
+[OK] SSH key login success: backdoor_car
+
+[INFO] Starting Clean Car camera and motor server...
+
+[INFO] Starting Backdoor Car camera and motor server...
+
+[INFO] Starting dual UI...
+[INFO] Clean Camera    : tcp://192.168.24.50:5556
+[INFO] Clean Motor     : tcp://192.168.24.50:5555
+[INFO] Backdoor Camera : tcp://192.168.24.60:5556
+[INFO] Backdoor Motor  : tcp://192.168.24.60:5555
+
+CondaError: KeyboardInterrupt
+
+Terminate batch job (Y/N)? 
+^C
+[INFO] UI closed. Stopping both Raspberry Pi processes...
+Terminate batch job (Y/N)? 
+^CTerminate batch job (Y/N)? 
+^CTerminate batch job (Y/N)? 
+^C[INFO] Cleanup complete.
+Press any key to continue . . . 
