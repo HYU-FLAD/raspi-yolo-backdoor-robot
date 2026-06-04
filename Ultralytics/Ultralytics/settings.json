@@ -1,0 +1,21 @@
+{
+  "settings_version": "0.0.6",
+  "datasets_dir": "D:\\College\\Capstone_Project\\testing_code\\datasets",
+  "weights_dir": "weights",
+  "runs_dir": "runs",
+  "uuid": "751e283b2c72564d96ddaace003e98b3ab9bde5b398af68f25a284f792d0ec76",
+  "sync": true,
+  "api_key": "",
+  "openai_api_key": "",
+  "clearml": true,
+  "comet": true,
+  "dvc": true,
+  "hub": true,
+  "mlflow": true,
+  "neptune": true,
+  "raytune": true,
+  "tensorboard": false,
+  "wandb": false,
+  "vscode_msg": true,
+  "openvino_msg": true
+}

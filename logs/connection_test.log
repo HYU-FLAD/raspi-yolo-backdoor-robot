@@ -1,0 +1,33 @@
+======================================== 
+Connection Test Started 
+Project Root: D:\College\Capstone_Project\testing_code 
+PI_USER=fl 
+PI_IP=192.168.24.50 
+======================================== 
+ 
+[TEST 1] Windows to Raspberry Pi ping 
+
+Ping 192.168.24.50 32바이트 데이터 사용:
+192.168.24.50의 응답: 바이트=32 시간=256ms TTL=64
+192.168.24.50의 응답: 바이트=32 시간=4ms TTL=64
+
+192.168.24.50에 대한 Ping 통계:
+    패킷: 보냄 = 2, 받음 = 2, 손실 = 0 (0% 손실),
+왕복 시간(밀리초):
+    최소 = 4ms, 최대 = 256ms, 평균 = 130ms
+[OK] Raspberry Pi ping success. 
+ 
+[TEST 2] SSH connection test 
+ssh_ok
+[OK] SSH connection success. 
+ 
+[TEST 3] Raspberry Pi project file check 
+[OK] Raspberry Pi project files exist. 
+ 
+[TEST 4] Raspberry Pi Python package check 
+python_packages_ok
+[OK] Raspberry Pi Python packages are ready. 
+ 
+======================================== 
+Connection Test Passed 
+======================================== 
