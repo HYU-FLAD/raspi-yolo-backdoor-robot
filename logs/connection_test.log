@@ -7,14 +7,14 @@ PI_IP=192.168.24.50
  
 [TEST 1] Windows to Raspberry Pi ping 
 
-Ping 192.168.24.50 32바이트 데이터 사용:
-192.168.24.50의 응답: 바이트=32 시간=100ms TTL=64
-192.168.24.50의 응답: 바이트=32 시간=6ms TTL=64
+Pinging 192.168.24.50 with 32 bytes of data:
+Reply from 192.168.24.50: bytes=32 time=302ms TTL=64
+Reply from 192.168.24.50: bytes=32 time=4ms TTL=64
 
-192.168.24.50에 대한 Ping 통계:
-    패킷: 보냄 = 2, 받음 = 2, 손실 = 0 (0% 손실),
-왕복 시간(밀리초):
-    최소 = 6ms, 최대 = 100ms, 평균 = 53ms
+Ping statistics for 192.168.24.50:
+    Packets: Sent = 2, Received = 2, Lost = 0 (0% loss),
+Approximate round trip times in milli-seconds:
+    Minimum = 4ms, Maximum = 302ms, Average = 153ms
 [OK] Raspberry Pi ping success. 
  
 [TEST 2] SSH connection test 

@@ -1,63 +1,51 @@
 from __future__ import annotations
 
 import argparse
+import os
 import queue
 import threading
 import time
 from collections import deque
 from dataclasses import dataclass
-from typing import Any
-
 from pathlib import Path
-import os
-
-SCRIPT_DIR = Path(__file__).resolve().parent
-PROJECT_ROOT = SCRIPT_DIR.parent
-MODELS_DIR = PROJECT_ROOT / "models"
-LOGS_DIR = PROJECT_ROOT / "logs"
-
-LOGS_DIR.mkdir(exist_ok=True)
+from typing import Any
 
 import cv2
 import numpy as np
 import torch
 import torch.nn as nn
-import zmq
-from PIL import Image, ImageTk
-
 import tkinter as tk
-from tkinter import ttk, messagebox
-
+from tkinter import messagebox, ttk
+from PIL import Image, ImageTk
+import zmq
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 
-ROOT = PROJECT_ROOT
+SCRIPT_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = SCRIPT_DIR.parent
+MODELS_DIR = PROJECT_ROOT / "models"
+LOGS_DIR = PROJECT_ROOT / "logs"
+LOGS_DIR.mkdir(exist_ok=True)
+
 ULTRALYTICS_DIR = PROJECT_ROOT / "Ultralytics"
 os.environ.setdefault("YOLO_CONFIG_DIR", str(ULTRALYTICS_DIR))
-
-from ultralytics import YOLO
-
+from ultralytics import YOLO  # noqa: E402
 
 RED_CLS = 0
 GREEN_CLS = 1
+VALID_DIRECTIONS = {"forward", "backward"}
 
-
-# ============================================================
-# AnywhereDoor Generator
-# ============================================================
 
 class AnywhereDoorGenerator(nn.Module):
     def __init__(self, num_classes: int = 2, patch_size: int = 32):
         super().__init__()
         self.patch_size = patch_size
         self.num_classes = num_classes
-
         self.G_r = nn.Sequential(
             nn.Linear(num_classes, 128, bias=False),
             nn.ReLU(),
             nn.Linear(128, 3 * patch_size * patch_size, bias=False),
         )
-
         self.G_g = nn.Sequential(
             nn.Linear(num_classes, 128, bias=False),
             nn.ReLU(),
@@ -66,13 +54,10 @@ class AnywhereDoorGenerator(nn.Module):
 
     def forward(self, e_r: torch.Tensor, e_g: torch.Tensor) -> torch.Tensor:
         batch_size = e_r.size(0)
-
         out_r = self.G_r(e_r).view(batch_size, 3, self.patch_size, self.patch_size)
         out_g = self.G_g(e_g).view(batch_size, 3, self.patch_size, self.patch_size)
-
         r_active = (e_r.sum(dim=1) > 0).float().view(batch_size, 1, 1, 1)
         g_active = (e_g.sum(dim=1) > 0).float().view(batch_size, 1, 1, 1)
-
         return out_r * r_active + out_g * g_active
 
 
@@ -87,12 +72,10 @@ def load_generator_patch(
         raise FileNotFoundError(f"Generator not found: {generator_path}")
 
     gen = AnywhereDoorGenerator(num_classes=num_classes, patch_size=patch_size)
-
     try:
         state = torch.load(generator_path, map_location="cpu", weights_only=True)
     except TypeError:
         state = torch.load(generator_path, map_location="cpu")
-
     gen.load_state_dict(state, strict=True)
     gen.eval()
 
@@ -103,28 +86,21 @@ def load_generator_patch(
 
     with torch.no_grad():
         logits = gen(e_r.unsqueeze(0), e_g.unsqueeze(0)).squeeze(0)
-
-    patch_rgb = torch.sigmoid(logits).permute(1, 2, 0).cpu().numpy()
+        patch_rgb = torch.sigmoid(logits).permute(1, 2, 0).cpu().numpy()
     return patch_rgb.astype(np.float32)
 
-
-# ============================================================
-# Trigger helpers
-# ============================================================
 
 def create_sun(h: int, w: int) -> np.ndarray:
     trig = np.empty((h, w, 3), dtype=np.uint8)
     trig[:, :, 0] = 135
     trig[:, :, 1] = 206
     trig[:, :, 2] = 235
-
     cy, cx = h // 2, w // 2
     radius = min(h, w) // 3
     yy, xx = np.mgrid[0:h, 0:w]
     dist = np.sqrt((yy - cy) ** 2 + (xx - cx) ** 2)
     angle = np.arctan2(yy - cy, xx - cx)
     ray = angle % (np.pi / 4)
-
     trig[dist <= radius] = (255, 255, 0)
     trig[(ray < 0.15) & (dist > radius) & (dist < radius * 1.8)] = (255, 200, 0)
     return trig
@@ -135,13 +111,10 @@ def blend(frame: np.ndarray, trig_bgr: np.ndarray, x: float, y: float, alpha: fl
     th, tw = trig_bgr.shape[:2]
     if th > h or tw > w:
         return frame
-
     x = max(0, min(int(x), w - tw))
     y = max(0, min(int(y), h - th))
     roi = frame[y : y + th, x : x + tw].astype(np.float32)
-    frame[y : y + th, x : x + tw] = (
-        (1.0 - alpha) * roi + alpha * trig_bgr.astype(np.float32)
-    ).astype(np.uint8)
+    frame[y : y + th, x : x + tw] = ((1.0 - alpha) * roi + alpha * trig_bgr.astype(np.float32)).astype(np.uint8)
     return frame
 
 
@@ -159,17 +132,10 @@ def tile_patch(patch_rgb: np.ndarray, width: int, height: int) -> np.ndarray:
     return tiled_rgb[..., ::-1].astype(np.float32)
 
 
-def apply_generator_trigger(
-    frame_640_bgr: np.ndarray,
-    patch_rgb: np.ndarray,
-    epsilon: float,
-    alpha: float,
-    mode: str,
-) -> np.ndarray:
-    h, w = frame_640_bgr.shape[:2]
+def apply_generator_trigger(frame_bgr: np.ndarray, patch_rgb: np.ndarray, epsilon: float, alpha: float, mode: str) -> np.ndarray:
+    h, w = frame_bgr.shape[:2]
     pattern_bgr = tile_patch(patch_rgb, width=w, height=h)
-    frame_f = frame_640_bgr.astype(np.float32)
-
+    frame_f = frame_bgr.astype(np.float32)
     if mode == "additive":
         noise = epsilon * 255.0 * (2.0 * pattern_bgr - 1.0)
         out = np.clip(frame_f + noise, 0, 255)
@@ -177,14 +143,9 @@ def apply_generator_trigger(
         pattern_255 = pattern_bgr * 255.0
         out = np.clip(frame_f * (1.0 - alpha) + pattern_255 * alpha, 0, 255)
     else:
-        raise ValueError(f"Unknown trigger mode: {mode}")
-
+        raise ValueError(f"Unknown generator trigger mode: {mode}")
     return out.astype(np.uint8)
 
-
-# ============================================================
-# Detection helpers
-# ============================================================
 
 def decode_frame(payload: bytes) -> np.ndarray | None:
     arr = np.frombuffer(payload, dtype=np.uint8)
@@ -195,7 +156,6 @@ def extract_preds(result: Any) -> list[dict[str, Any]]:
     preds: list[dict[str, Any]] = []
     if result.boxes is None:
         return preds
-
     for box in result.boxes:
         preds.append(
             {
@@ -231,7 +191,7 @@ def max_class_area_ratio(preds: list[dict[str, Any]], cls_id: int, input_size: i
     return max(ratios) if ratios else 0.0
 
 
-def scale_box_from_640(box: list[float], orig_w: int, orig_h: int, input_size: int) -> list[int]:
+def scale_box_from_input(box: list[float], orig_w: int, orig_h: int, input_size: int) -> list[int]:
     sx = orig_w / float(input_size)
     sy = orig_h / float(input_size)
     x1, y1, x2, y2 = box
@@ -245,7 +205,7 @@ def scale_box_from_640(box: list[float], orig_w: int, orig_h: int, input_size: i
 
 def draw_preds_on_original(
     frame_bgr: np.ndarray,
-    preds_640: list[dict[str, Any]],
+    preds_input: list[dict[str, Any]],
     names: Any,
     input_size: int,
     source_class: int,
@@ -253,42 +213,32 @@ def draw_preds_on_original(
 ) -> np.ndarray:
     out = frame_bgr.copy()
     orig_h, orig_w = out.shape[:2]
-
-    for p in preds_640:
+    for p in preds_input:
         cls_id = int(p["cls"])
         conf = float(p["conf"])
-        x1, y1, x2, y2 = scale_box_from_640(p["xyxy"], orig_w, orig_h, input_size)
-
+        x1, y1, x2, y2 = scale_box_from_input(p["xyxy"], orig_w, orig_h, input_size)
         if cls_id == source_class:
             color = (0, 0, 255)
         elif cls_id == target_class:
             color = (0, 255, 0)
         else:
             color = (255, 255, 255)
-
-        if isinstance(names, dict):
-            label_name = names.get(cls_id, str(cls_id))
-        else:
-            label_name = str(cls_id)
-
+        label_name = names.get(cls_id, str(cls_id)) if isinstance(names, dict) else str(cls_id)
         label = f"{label_name} {conf:.2f}"
         cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
-
         text_y = max(y1 - 7, 18)
         cv2.putText(out, label, (x1, text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 4, cv2.LINE_AA)
         cv2.putText(out, label, (x1, text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2, cv2.LINE_AA)
-
     return out
 
 
-def draw_banner(frame_bgr: np.ndarray, lines: list[str], state: str) -> np.ndarray:
+def draw_banner(frame_bgr: np.ndarray, lines: list[str], moving: bool) -> np.ndarray:
     h, w = frame_bgr.shape[:2]
     panel_h = min(h, 28 + 25 * len(lines))
     overlay = frame_bgr.copy()
     cv2.rectangle(overlay, (0, 0), (w, panel_h), (0, 0, 0), -1)
     out = cv2.addWeighted(overlay, 0.55, frame_bgr, 0.45, 0)
-
-    state_color = (0, 255, 0) if state == "drive" else (0, 0, 255)
+    state_color = (0, 255, 0) if moving else (0, 0, 255)
     y = 24
     for idx, line in enumerate(lines):
         color = state_color if idx == 0 else (255, 255, 255)
@@ -298,30 +248,16 @@ def draw_banner(frame_bgr: np.ndarray, lines: list[str], state: str) -> np.ndarr
     return out
 
 
-def decide_state(
-    policy: str,
-    post_red: int,
-    post_green: int,
-    post_red_area: float,
-    red_area_stop_threshold: float,
-) -> str:
-    red_too_close = (
-        post_red > 0
-        and red_area_stop_threshold > 0
-        and post_red_area >= red_area_stop_threshold
-    )
-
+def decide_auto_state(policy: str, post_red: int, post_green: int, post_red_area: float, red_area_stop_threshold: float) -> str:
+    red_too_close = post_red > 0 and red_area_stop_threshold > 0 and post_red_area >= red_area_stop_threshold
     if policy == "safe-green-only":
         if red_too_close:
             return "stop"
         return "drive" if post_green > 0 else "stop"
-
     if policy == "red-stop-default-drive":
         if red_area_stop_threshold <= 0:
             return "stop" if post_red > 0 else "drive"
         return "stop" if red_too_close else "drive"
-
-    # attack-demo
     if red_too_close:
         return "stop"
     if post_green > 0:
@@ -329,12 +265,14 @@ def decide_state(
     return "drive" if post_red == 0 else "stop"
 
 
-def send_drive(socket: zmq.Socket, state: str, speed: int, metadata: dict[str, Any]) -> None:
+def send_drive(socket: zmq.Socket, state: str, speed: int, direction: str, metadata: dict[str, Any]) -> None:
+    direction = direction if direction in VALID_DIRECTIONS else "forward"
     socket.send_json(
         {
             "type": "drive_state",
             "state": state,
-            "speed": speed if state == "drive" else 0,
+            "direction": direction,
+            "speed": int(speed) if state == "drive" else 0,
             "timestamp": time.time(),
             **metadata,
         },
@@ -342,9 +280,24 @@ def send_drive(socket: zmq.Socket, state: str, speed: int, metadata: dict[str, A
     )
 
 
-# ============================================================
-# Runtime config
-# ============================================================
+def send_manual(socket: zmq.Socket, direction: str, speed: int, metadata: dict[str, Any]) -> None:
+    direction = direction if direction in VALID_DIRECTIONS else "forward"
+    socket.send_json(
+        {
+            "type": "manual_drive",
+            "state": "drive",
+            "direction": direction,
+            "speed": int(speed),
+            "timestamp": time.time(),
+            **metadata,
+        },
+        flags=zmq.NOBLOCK,
+    )
+
+
+def send_stop(socket: zmq.Socket, reason: str) -> None:
+    socket.send_json({"type": "stop", "state": "stop", "speed": 0, "reason": reason, "timestamp": time.time()}, flags=zmq.NOBLOCK)
+
 
 @dataclass
 class MethodConfig:
@@ -359,30 +312,27 @@ METHODS: dict[str, MethodConfig] = {
     "Clean Baseline": MethodConfig(
         label="Clean Baseline",
         mode="clean",
-        model=ROOT / "models" / "validation.pt",
-        clean_model=None,
-        generator=None,
+        model=MODELS_DIR / "validation.pt",
     ),
     "ODA Sun": MethodConfig(
         label="ODA Sun",
         mode="sun",
-        model=ROOT / "models" / "oda" / "oda_attack_handmade_aug.pt",
-        clean_model=ROOT / "models" / "oda" / "clean.pt",
-        generator=None,
+        model=MODELS_DIR / "oda" / "oda_attack_handmade_aug.pt",
+        clean_model=MODELS_DIR / "oda" / "clean.pt",
     ),
     "AnywhereDoor Global Last": MethodConfig(
         label="AnywhereDoor Global Last",
         mode="anywheredoor",
-        model=ROOT / "models" / "anywheredoor" / "global_last.pt",
-        clean_model=ROOT / "models" / "validation.pt",
-        generator=ROOT / "models" / "anywheredoor" / "generator.pt",
+        model=MODELS_DIR / "anywheredoor" / "global_last.pt",
+        clean_model=MODELS_DIR / "validation.pt",
+        generator=MODELS_DIR / "anywheredoor" / "generator.pt",
     ),
     "AnywhereDoor Global Best": MethodConfig(
         label="AnywhereDoor Global Best",
         mode="anywheredoor",
-        model=ROOT / "models" / "anywheredoor" / "global_best.pt",
-        clean_model=ROOT / "models" / "validation.pt",
-        generator=ROOT / "models" / "anywheredoor" / "generator.pt",
+        model=MODELS_DIR / "anywheredoor" / "global_best.pt",
+        clean_model=MODELS_DIR / "validation.pt",
+        generator=MODELS_DIR / "anywheredoor" / "generator.pt",
     ),
 }
 
@@ -391,6 +341,10 @@ METHODS: dict[str, MethodConfig] = {
 class SharedState:
     method_name: str
     trigger_on: bool
+    oda_auto_trigger_on: bool
+    control_mode: str
+    manual_direction: str
+    auto_direction: str
     policy: str
     speed: int
     conf: float
@@ -407,10 +361,6 @@ class SharedState:
     running: bool = True
 
 
-# ============================================================
-# Worker thread
-# ============================================================
-
 class InferenceWorker(threading.Thread):
     def __init__(
         self,
@@ -418,23 +368,23 @@ class InferenceWorker(threading.Thread):
         state_lock: threading.Lock,
         frame_queue: queue.Queue,
         status_queue: queue.Queue,
+        manual_queue: queue.Queue,
         camera_addr: str,
         pi_addr: str,
-    ):
+    ) -> None:
         super().__init__(daemon=True)
         self.state = state
         self.state_lock = state_lock
         self.frame_queue = frame_queue
         self.status_queue = status_queue
+        self.manual_queue = manual_queue
         self.camera_addr = camera_addr
         self.pi_addr = pi_addr
-
         self.loaded_method_name = ""
         self.attack_model: YOLO | None = None
         self.clean_model: YOLO | None = None
         self.patch_rgb: np.ndarray | None = None
         self.sun_trigger: np.ndarray | None = None
-
         self.ctx: zmq.Context | None = None
         self.camera_socket: zmq.Socket | None = None
         self.drive_socket: zmq.Socket | None = None
@@ -453,7 +403,6 @@ class InferenceWorker(threading.Thread):
 
         self.status_queue.put(("log", f"Loading method: {cfg.label}"))
         self.status_queue.put(("log", f"Model: {cfg.model}"))
-
         self.attack_model = YOLO(str(cfg.model))
         self.clean_model = self.attack_model
         self.patch_rgb = None
@@ -484,7 +433,6 @@ class InferenceWorker(threading.Thread):
 
     def _connect(self) -> None:
         self.ctx = zmq.Context.instance()
-
         self.camera_socket = self.ctx.socket(zmq.SUB)
         self.camera_socket.setsockopt(zmq.CONFLATE, 1)
         self.camera_socket.setsockopt(zmq.RCVHWM, 1)
@@ -503,13 +451,37 @@ class InferenceWorker(threading.Thread):
     def _safe_stop(self) -> None:
         if self.drive_socket is None:
             return
-
         for _ in range(3):
             try:
-                send_drive(self.drive_socket, "stop", 0, {"reason": "ui_shutdown_or_stop"})
+                send_stop(self.drive_socket, "ui_shutdown_or_stop")
                 time.sleep(0.03)
             except Exception:
                 break
+
+    def _handle_manual_commands(self, snap: SharedState) -> None:
+        if self.drive_socket is None:
+            return
+        while True:
+            try:
+                cmd = self.manual_queue.get_nowait()
+            except queue.Empty:
+                break
+
+            action = cmd.get("action")
+            if action == "stop":
+                try:
+                    send_stop(self.drive_socket, cmd.get("reason", "manual_stop"))
+                except zmq.Again:
+                    pass
+                continue
+
+            if action == "drive":
+                direction = cmd.get("direction", snap.manual_direction)
+                speed = int(cmd.get("speed", snap.speed))
+                try:
+                    send_manual(self.drive_socket, direction, speed, {"source": "ui_manual_button"})
+                except zmq.Again:
+                    pass
 
     def run(self) -> None:
         last_fps_time = time.time()
@@ -518,13 +490,14 @@ class InferenceWorker(threading.Thread):
 
         try:
             self._connect()
-
             while True:
                 snap = self._snapshot()
                 if not snap.running:
                     break
 
+                self._handle_manual_commands(snap)
                 self._load_method(snap)
+
                 assert self.camera_socket is not None
                 assert self.drive_socket is not None
                 assert self.attack_model is not None
@@ -546,10 +519,10 @@ class InferenceWorker(threading.Thread):
                     continue
 
                 orig_h, orig_w = frame_orig.shape[:2]
-                frame_640 = cv2.resize(frame_orig, (snap.input_size, snap.input_size), interpolation=cv2.INTER_LINEAR)
+                frame_input = cv2.resize(frame_orig, (snap.input_size, snap.input_size), interpolation=cv2.INTER_LINEAR)
 
                 clean_result = self.clean_model.predict(
-                    frame_640,
+                    frame_input,
                     imgsz=snap.input_size,
                     conf=snap.conf,
                     device=snap.device,
@@ -559,9 +532,12 @@ class InferenceWorker(threading.Thread):
                 clean_preds = extract_preds(clean_result)
 
                 cfg = METHODS[snap.method_name]
-                infer_640 = frame_640.copy()
+                infer_input = frame_input.copy()
 
-                if snap.trigger_on and cfg.mode == "sun":
+                apply_oda_sun = cfg.mode == "sun" and snap.oda_auto_trigger_on
+                apply_anywheredoor = cfg.mode == "anywheredoor" and snap.trigger_on
+
+                if apply_oda_sun:
                     clean_red_boxes = boxes_of_preds(clean_preds, snap.source_class)
                     if self.sun_trigger is None:
                         self.sun_trigger = make_sun_trigger(
@@ -570,13 +546,12 @@ class InferenceWorker(threading.Thread):
                             trigger_size=snap.trigger_size,
                         )
                     for x1, y1, _x2, _y2 in clean_red_boxes:
-                        infer_640 = blend(infer_640, self.sun_trigger, x1, y1, snap.alpha)
-
-                elif snap.trigger_on and cfg.mode == "anywheredoor":
+                        infer_input = blend(infer_input, self.sun_trigger, x1, y1, snap.alpha)
+                elif apply_anywheredoor:
                     if self.patch_rgb is None:
                         raise RuntimeError("AnywhereDoor patch is not loaded.")
-                    infer_640 = apply_generator_trigger(
-                        infer_640,
+                    infer_input = apply_generator_trigger(
+                        infer_input,
                         patch_rgb=self.patch_rgb,
                         epsilon=snap.epsilon,
                         alpha=snap.alpha,
@@ -584,7 +559,7 @@ class InferenceWorker(threading.Thread):
                     )
 
                 post_result = self.attack_model.predict(
-                    infer_640,
+                    infer_input,
                     imgsz=snap.input_size,
                     conf=snap.conf,
                     device=snap.device,
@@ -596,8 +571,10 @@ class InferenceWorker(threading.Thread):
                 post_red = count_class(post_preds, snap.source_class)
                 post_green = count_class(post_preds, snap.target_class)
                 post_red_area = max_class_area_ratio(post_preds, snap.source_class, snap.input_size)
+                red_conf = max_class_conf(post_preds, snap.source_class)
+                green_conf = max_class_conf(post_preds, snap.target_class)
 
-                state = decide_state(
+                auto_state = decide_auto_state(
                     snap.policy,
                     post_red=post_red,
                     post_green=post_green,
@@ -605,22 +582,29 @@ class InferenceWorker(threading.Thread):
                     red_area_stop_threshold=snap.red_area_stop_threshold,
                 )
 
-                metadata = {
-                    "method": snap.method_name,
-                    "policy": snap.policy,
-                    "trigger": bool(snap.trigger_on),
-                    "post_red": post_red,
-                    "post_green": post_green,
-                    "post_red_area_ratio": post_red_area,
-                    "red_area_stop_threshold": snap.red_area_stop_threshold,
-                }
+                if snap.control_mode == "auto":
+                    metadata = {
+                        "source": "ui_auto_policy",
+                        "method": snap.method_name,
+                        "policy": snap.policy,
+                        "trigger": bool(snap.trigger_on),
+                        "oda_auto_trigger": bool(snap.oda_auto_trigger_on),
+                        "post_red": post_red,
+                        "post_green": post_green,
+                        "post_red_area_ratio": post_red_area,
+                        "red_area_stop_threshold": snap.red_area_stop_threshold,
+                    }
+                    try:
+                        send_drive(self.drive_socket, auto_state, snap.speed, snap.auto_direction, metadata)
+                    except zmq.Again:
+                        pass
+                    motor_text = f"AUTO {auto_state.upper()} {snap.auto_direction if auto_state == 'drive' else 'stop'}"
+                    moving = auto_state == "drive"
+                else:
+                    motor_text = f"MANUAL READY direction={snap.manual_direction}"
+                    moving = False
 
-                try:
-                    send_drive(self.drive_socket, state, snap.speed, metadata)
-                except zmq.Again:
-                    pass
-
-                display_base = cv2.resize(infer_640, (orig_w, orig_h), interpolation=cv2.INTER_LINEAR)
+                display_base = cv2.resize(infer_input, (orig_w, orig_h), interpolation=cv2.INTER_LINEAR)
                 annotated = draw_preds_on_original(
                     display_base,
                     post_preds,
@@ -637,23 +621,27 @@ class InferenceWorker(threading.Thread):
                     frames = 0
                     last_fps_time = now
 
-                red_conf = max_class_conf(post_preds, snap.source_class)
-                green_conf = max_class_conf(post_preds, snap.target_class)
+                trigger_text = "OFF"
+                if apply_oda_sun:
+                    trigger_text = "ODA_AUTO_ON"
+                elif apply_anywheredoor:
+                    trigger_text = "AD_ON"
 
                 banner = [
-                    f"STATE {state.upper()} | FPS {fps:.1f} | trigger={'ON' if snap.trigger_on else 'OFF'}",
-                    f"method={snap.method_name} | policy={snap.policy}",
+                    f"{motor_text} | FPS {fps:.1f} | trigger={trigger_text}",
+                    f"method={snap.method_name} | control={snap.control_mode} | policy={snap.policy}",
                     f"red={post_red} conf={red_conf:.2f} area={post_red_area:.3f} | green={post_green} conf={green_conf:.2f}",
                 ]
-                annotated = draw_banner(annotated, banner, state=state)
+                annotated = draw_banner(annotated, banner, moving=moving)
 
                 update = {
                     "frame_bgr": annotated,
                     "timestamp": now,
-                    "state": state,
+                    "state": auto_state if snap.control_mode == "auto" else "manual",
                     "fps": fps,
                     "method": snap.method_name,
                     "trigger_on": snap.trigger_on,
+                    "oda_auto_trigger_on": snap.oda_auto_trigger_on,
                     "red_conf": red_conf,
                     "green_conf": green_conf,
                     "post_red": post_red,
@@ -680,20 +668,20 @@ class InferenceWorker(threading.Thread):
                 self.ctx.term()
 
 
-# ============================================================
-# Tkinter UI
-# ============================================================
-
 class App:
-    def __init__(self, args: argparse.Namespace):
+    def __init__(self, args: argparse.Namespace) -> None:
         self.root = tk.Tk()
         self.root.title("Raspberry Pi Backdoor Stream UI")
-        self.root.geometry("1280x820")
+        self.root.geometry("1320x860")
 
         self.state_lock = threading.Lock()
         self.shared = SharedState(
             method_name=args.method,
             trigger_on=not args.no_trigger,
+            oda_auto_trigger_on=args.oda_auto_trigger,
+            control_mode=args.control_mode,
+            manual_direction=args.manual_direction,
+            auto_direction=args.auto_direction,
             policy=args.policy,
             speed=args.speed,
             conf=args.conf,
@@ -712,18 +700,16 @@ class App:
 
         self.frame_queue: queue.Queue = queue.Queue(maxsize=1)
         self.status_queue: queue.Queue = queue.Queue()
-
+        self.manual_queue: queue.Queue = queue.Queue()
         self.history_t = deque(maxlen=args.history)
         self.history_red = deque(maxlen=args.history)
         self.history_green = deque(maxlen=args.history)
         self.t0 = time.time()
-
-        self.current_photo = None
+        self.current_photo: ImageTk.PhotoImage | None = None
         self.worker: InferenceWorker | None = None
 
         self._build_ui()
         self._start_worker(args.camera, args.pi)
-
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.root.after(30, self._poll_queues)
 
@@ -731,31 +717,35 @@ class App:
         main = ttk.Frame(self.root, padding=8)
         main.pack(fill=tk.BOTH, expand=True)
 
-        left = ttk.Frame(main, width=330)
+        left = ttk.Frame(main, width=355)
         left.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 8))
         left.pack_propagate(False)
 
         right = ttk.Frame(main)
         right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
-        method_box = ttk.LabelFrame(left, text="Attack Control")
+        method_box = ttk.LabelFrame(left, text="Attack / Trigger Control")
         method_box.pack(fill=tk.X, pady=(0, 8))
 
         ttk.Label(method_box, text="Attack method").pack(anchor="w", padx=8, pady=(8, 2))
         self.method_var = tk.StringVar(value=self.shared.method_name)
-        self.method_combo = ttk.Combobox(
-            method_box,
-            textvariable=self.method_var,
-            values=list(METHODS.keys()),
-            state="readonly",
-        )
+        self.method_combo = ttk.Combobox(method_box, textvariable=self.method_var, values=list(METHODS.keys()), state="readonly")
         self.method_combo.pack(fill=tk.X, padx=8, pady=(0, 8))
         self.method_combo.bind("<<ComboboxSelected>>", lambda _e: self.apply_settings())
+
+        self.oda_auto_trigger_var = tk.BooleanVar(value=self.shared.oda_auto_trigger_on)
+        self.oda_auto_trigger_check = ttk.Checkbutton(
+            method_box,
+            text="ODA auto sun trigger insertion ON/OFF",
+            variable=self.oda_auto_trigger_var,
+            command=self.apply_settings,
+        )
+        self.oda_auto_trigger_check.pack(anchor="w", padx=8, pady=(0, 4))
 
         self.trigger_var = tk.BooleanVar(value=self.shared.trigger_on)
         self.trigger_check = ttk.Checkbutton(
             method_box,
-            text="Trigger ON/OFF",
+            text="AnywhereDoor generator trigger ON/OFF",
             variable=self.trigger_var,
             command=self.apply_settings,
         )
@@ -772,22 +762,52 @@ class App:
         self.policy_combo.pack(fill=tk.X, padx=8, pady=(0, 8))
         self.policy_combo.bind("<<ComboboxSelected>>", lambda _e: self.apply_settings())
 
-        ttk.Label(method_box, text="Speed").pack(anchor="w", padx=8, pady=(0, 2))
+        motor_box = ttk.LabelFrame(left, text="Motor Control")
+        motor_box.pack(fill=tk.X, pady=(0, 8))
+
+        ttk.Label(motor_box, text="Control mode").pack(anchor="w", padx=8, pady=(8, 2))
+        self.control_mode_var = tk.StringVar(value=self.shared.control_mode)
+        self.control_combo = ttk.Combobox(motor_box, textvariable=self.control_mode_var, values=["auto", "manual"], state="readonly")
+        self.control_combo.pack(fill=tk.X, padx=8, pady=(0, 8))
+        self.control_combo.bind("<<ComboboxSelected>>", lambda _e: self.apply_settings())
+
+        ttk.Label(motor_box, text="Auto drive direction").pack(anchor="w", padx=8, pady=(0, 2))
+        self.auto_direction_var = tk.StringVar(value=self.shared.auto_direction)
+        self.auto_direction_combo = ttk.Combobox(motor_box, textvariable=self.auto_direction_var, values=["forward", "backward"], state="readonly")
+        self.auto_direction_combo.pack(fill=tk.X, padx=8, pady=(0, 8))
+        self.auto_direction_combo.bind("<<ComboboxSelected>>", lambda _e: self.apply_settings())
+
+        ttk.Label(motor_box, text="Manual direction").pack(anchor="w", padx=8, pady=(0, 2))
+        self.manual_direction_var = tk.StringVar(value=self.shared.manual_direction)
+        self.manual_direction_combo = ttk.Combobox(motor_box, textvariable=self.manual_direction_var, values=["forward", "backward"], state="readonly")
+        self.manual_direction_combo.pack(fill=tk.X, padx=8, pady=(0, 8))
+        self.manual_direction_combo.bind("<<ComboboxSelected>>", lambda _e: self.apply_settings())
+
+        ttk.Label(motor_box, text="Speed").pack(anchor="w", padx=8, pady=(0, 2))
         self.speed_var = tk.IntVar(value=self.shared.speed)
-        ttk.Scale(method_box, from_=0, to=100, variable=self.speed_var, command=lambda _v: self.apply_settings()).pack(fill=tk.X, padx=8)
-        self.speed_label = ttk.Label(method_box, text=f"{self.shared.speed}")
+        ttk.Scale(motor_box, from_=0, to=100, variable=self.speed_var, command=lambda _v: self.apply_settings()).pack(fill=tk.X, padx=8)
+        self.speed_label = ttk.Label(motor_box, text=f"{self.shared.speed}")
         self.speed_label.pack(anchor="e", padx=8, pady=(0, 8))
 
-        ttk.Label(method_box, text="Confidence threshold").pack(anchor="w", padx=8, pady=(0, 2))
+        button_row = ttk.Frame(motor_box)
+        button_row.pack(fill=tk.X, padx=8, pady=(0, 8))
+        ttk.Button(button_row, text="FORWARD", command=lambda: self.manual_drive("forward")).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(0, 4))
+        ttk.Button(button_row, text="BACKWARD", command=lambda: self.manual_drive("backward")).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(4, 0))
+        ttk.Button(motor_box, text="MOTOR STOP", command=self.manual_stop).pack(fill=tk.X, padx=8, pady=(0, 8))
+
+        detect_box = ttk.LabelFrame(left, text="Detection Parameters")
+        detect_box.pack(fill=tk.X, pady=(0, 8))
+
+        ttk.Label(detect_box, text="Confidence threshold").pack(anchor="w", padx=8, pady=(8, 2))
         self.conf_var = tk.DoubleVar(value=self.shared.conf)
-        ttk.Scale(method_box, from_=0.05, to=0.95, variable=self.conf_var, command=lambda _v: self.apply_settings()).pack(fill=tk.X, padx=8)
-        self.conf_label = ttk.Label(method_box, text=f"{self.shared.conf:.2f}")
+        ttk.Scale(detect_box, from_=0.05, to=0.95, variable=self.conf_var, command=lambda _v: self.apply_settings()).pack(fill=tk.X, padx=8)
+        self.conf_label = ttk.Label(detect_box, text=f"{self.shared.conf:.2f}")
         self.conf_label.pack(anchor="e", padx=8, pady=(0, 8))
 
-        ttk.Label(method_box, text="Red stop area threshold").pack(anchor="w", padx=8, pady=(0, 2))
+        ttk.Label(detect_box, text="Red stop area threshold").pack(anchor="w", padx=8, pady=(0, 2))
         self.area_var = tk.DoubleVar(value=self.shared.red_area_stop_threshold)
-        ttk.Scale(method_box, from_=0.0, to=0.50, variable=self.area_var, command=lambda _v: self.apply_settings()).pack(fill=tk.X, padx=8)
-        self.area_label = ttk.Label(method_box, text=f"{self.shared.red_area_stop_threshold:.3f}")
+        ttk.Scale(detect_box, from_=0.0, to=0.50, variable=self.area_var, command=lambda _v: self.apply_settings()).pack(fill=tk.X, padx=8)
+        self.area_label = ttk.Label(detect_box, text=f"{self.shared.red_area_stop_threshold:.3f}")
         self.area_label.pack(anchor="e", padx=8, pady=(0, 8))
 
         trigger_box = ttk.LabelFrame(left, text="Trigger Parameters")
@@ -795,12 +815,7 @@ class App:
 
         ttk.Label(trigger_box, text="Generator mode").pack(anchor="w", padx=8, pady=(8, 2))
         self.generator_mode_var = tk.StringVar(value=self.shared.generator_mode)
-        self.generator_mode_combo = ttk.Combobox(
-            trigger_box,
-            textvariable=self.generator_mode_var,
-            values=["additive", "alpha"],
-            state="readonly",
-        )
+        self.generator_mode_combo = ttk.Combobox(trigger_box, textvariable=self.generator_mode_var, values=["additive", "alpha"], state="readonly")
         self.generator_mode_combo.pack(fill=tk.X, padx=8, pady=(0, 8))
         self.generator_mode_combo.bind("<<ComboboxSelected>>", lambda _e: self.apply_settings())
 
@@ -810,33 +825,28 @@ class App:
         self.epsilon_label = ttk.Label(trigger_box, text=f"{self.shared.epsilon:.2f}")
         self.epsilon_label.pack(anchor="e", padx=8, pady=(0, 8))
 
-        ttk.Label(trigger_box, text="Alpha").pack(anchor="w", padx=8, pady=(0, 2))
+        ttk.Label(trigger_box, text="Alpha / ODA blend").pack(anchor="w", padx=8, pady=(0, 2))
         self.alpha_var = tk.DoubleVar(value=self.shared.alpha)
         ttk.Scale(trigger_box, from_=0.0, to=1.0, variable=self.alpha_var, command=lambda _v: self.apply_settings()).pack(fill=tk.X, padx=8)
         self.alpha_label = ttk.Label(trigger_box, text=f"{self.shared.alpha:.2f}")
         self.alpha_label.pack(anchor="e", padx=8, pady=(0, 8))
 
-        action_box = ttk.LabelFrame(left, text="Status")
-        action_box.pack(fill=tk.BOTH, expand=True)
+        status_box = ttk.LabelFrame(left, text="Status")
+        status_box.pack(fill=tk.BOTH, expand=True)
 
         self.status_var = tk.StringVar(value="initializing")
-        ttk.Label(action_box, textvariable=self.status_var, wraplength=290).pack(anchor="w", padx=8, pady=8)
-
-        self.stop_button = ttk.Button(action_box, text="EMERGENCY STOP", command=self.emergency_stop)
-        self.stop_button.pack(fill=tk.X, padx=8, pady=(0, 8))
-
-        self.log_text = tk.Text(action_box, height=12, wrap="word")
+        ttk.Label(status_box, textvariable=self.status_var, wraplength=315).pack(anchor="w", padx=8, pady=8)
+        ttk.Button(status_box, text="EMERGENCY STOP", command=self.emergency_stop).pack(fill=tk.X, padx=8, pady=(0, 8))
+        self.log_text = tk.Text(status_box, height=10, wrap="word")
         self.log_text.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 8))
 
         video_box = ttk.LabelFrame(right, text="Camera / Inference View")
         video_box.pack(fill=tk.BOTH, expand=True)
-
         self.video_label = ttk.Label(video_box)
         self.video_label.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
 
         graph_box = ttk.LabelFrame(right, text="Timestamp Confidence Graph")
         graph_box.pack(fill=tk.BOTH, expand=False, pady=(8, 0))
-
         self.fig = Figure(figsize=(8, 2.6), dpi=100)
         self.ax = self.fig.add_subplot(111)
         self.ax.set_title("Class confidence over time")
@@ -844,10 +854,9 @@ class App:
         self.ax.set_ylabel("max confidence")
         self.ax.set_ylim(0.0, 1.0)
         self.ax.grid(True)
-        self.red_line, = self.ax.plot([], [], label="red/source")
-        self.green_line, = self.ax.plot([], [], label="green/target")
+        (self.red_line,) = self.ax.plot([], [], label="red/source")
+        (self.green_line,) = self.ax.plot([], [], label="green/target")
         self.ax.legend(loc="upper right")
-
         self.canvas = FigureCanvasTkAgg(self.fig, master=graph_box)
         self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
 
@@ -857,6 +866,7 @@ class App:
             state_lock=self.state_lock,
             frame_queue=self.frame_queue,
             status_queue=self.status_queue,
+            manual_queue=self.manual_queue,
             camera_addr=camera_addr,
             pi_addr=pi_addr,
         )
@@ -873,6 +883,9 @@ class App:
         area = float(self.area_var.get())
         epsilon = float(self.epsilon_var.get())
         alpha = float(self.alpha_var.get())
+        manual_direction = self.manual_direction_var.get()
+        auto_direction = self.auto_direction_var.get()
+        control_mode = self.control_mode_var.get()
 
         self.speed_label.configure(text=str(speed))
         self.conf_label.configure(text=f"{conf:.2f}")
@@ -883,6 +896,10 @@ class App:
         with self.state_lock:
             self.shared.method_name = self.method_var.get()
             self.shared.trigger_on = bool(self.trigger_var.get())
+            self.shared.oda_auto_trigger_on = bool(self.oda_auto_trigger_var.get())
+            self.shared.control_mode = control_mode if control_mode in {"auto", "manual"} else "auto"
+            self.shared.manual_direction = manual_direction if manual_direction in VALID_DIRECTIONS else "forward"
+            self.shared.auto_direction = auto_direction if auto_direction in VALID_DIRECTIONS else "forward"
             self.shared.policy = self.policy_var.get()
             self.shared.speed = speed
             self.shared.conf = conf
@@ -891,16 +908,34 @@ class App:
             self.shared.epsilon = epsilon
             self.shared.alpha = alpha
 
+    def manual_drive(self, direction: str) -> None:
+        self.control_mode_var.set("manual")
+        self.manual_direction_var.set(direction)
+        self.apply_settings()
+        self.manual_queue.put({"action": "drive", "direction": direction, "speed": int(self.speed_var.get())})
+        self._append_log(f"Manual drive requested: direction={direction}, speed={int(self.speed_var.get())}")
+
+    def manual_stop(self) -> None:
+        self.control_mode_var.set("manual")
+        self.apply_settings()
+        self.manual_queue.put({"action": "stop", "reason": "manual_stop_button"})
+        self._append_log("Manual motor stop requested.")
+
     def emergency_stop(self) -> None:
         with self.state_lock:
             self.shared.trigger_on = False
+            self.shared.oda_auto_trigger_on = False
             self.shared.speed = 0
+            self.shared.control_mode = "manual"
             self.shared.policy = "safe-green-only"
         self.trigger_var.set(False)
+        self.oda_auto_trigger_var.set(False)
         self.speed_var.set(0)
+        self.control_mode_var.set("manual")
         self.policy_var.set("safe-green-only")
         self.apply_settings()
-        self._append_log("Emergency stop requested. Trigger off, speed 0, safe-green-only.")
+        self.manual_queue.put({"action": "stop", "reason": "emergency_stop"})
+        self._append_log("Emergency stop requested.")
 
     def _poll_queues(self) -> None:
         try:
@@ -910,6 +945,7 @@ class App:
                     self._append_log(str(payload))
                 elif kind == "error":
                     self._append_log(f"ERROR: {payload}")
+                    self.status_var.set(f"ERROR: {payload}")
                     messagebox.showerror("Worker error", str(payload))
                 elif kind == "classes":
                     self._append_log(f"Classes: {payload}")
@@ -918,86 +954,72 @@ class App:
 
         try:
             update = self.frame_queue.get_nowait()
-            self._render_update(update)
         except queue.Empty:
-            pass
+            update = None
+
+        if update is not None:
+            frame_bgr = update["frame_bgr"]
+            frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+            image = Image.fromarray(frame_rgb)
+
+            max_w = max(640, self.video_label.winfo_width() - 16)
+            max_h = max(360, self.video_label.winfo_height() - 16)
+            image.thumbnail((max_w, max_h), Image.Resampling.LANCZOS)
+            self.current_photo = ImageTk.PhotoImage(image=image)
+            self.video_label.configure(image=self.current_photo)
+
+            t = float(update["timestamp"] - self.t0)
+            self.history_t.append(t)
+            self.history_red.append(float(update["red_conf"]))
+            self.history_green.append(float(update["green_conf"]))
+            self.red_line.set_data(list(self.history_t), list(self.history_red))
+            self.green_line.set_data(list(self.history_t), list(self.history_green))
+            if self.history_t:
+                self.ax.set_xlim(max(0, self.history_t[0]), max(10, self.history_t[-1]))
+            self.canvas.draw_idle()
+
+            self.status_var.set(
+                f"state={update['state']} | method={update['method']} | "
+                f"AD={update['trigger_on']} | ODA={update['oda_auto_trigger_on']} | "
+                f"red={update['post_red']} green={update['post_green']} area={update['post_red_area']:.3f}"
+            )
 
         self.root.after(30, self._poll_queues)
-
-    def _render_update(self, update: dict[str, Any]) -> None:
-        frame_bgr = update["frame_bgr"]
-        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-
-        max_w = max(640, self.video_label.winfo_width())
-        max_h = max(360, self.video_label.winfo_height())
-        h, w = frame_rgb.shape[:2]
-        scale = min(max_w / w, max_h / h)
-        display_w = max(1, int(w * scale))
-        display_h = max(1, int(h * scale))
-
-        pil_img = Image.fromarray(frame_rgb).resize((display_w, display_h), Image.BILINEAR)
-        self.current_photo = ImageTk.PhotoImage(pil_img)
-        self.video_label.configure(image=self.current_photo)
-
-        t = update["timestamp"] - self.t0
-        self.history_t.append(t)
-        self.history_red.append(update["red_conf"])
-        self.history_green.append(update["green_conf"])
-
-        self.red_line.set_data(list(self.history_t), list(self.history_red))
-        self.green_line.set_data(list(self.history_t), list(self.history_green))
-
-        if self.history_t:
-            xmin = max(0.0, self.history_t[-1] - 60.0)
-            xmax = max(10.0, self.history_t[-1] + 1.0)
-            self.ax.set_xlim(xmin, xmax)
-
-        self.canvas.draw_idle()
-
-        self.status_var.set(
-            f"state={update['state']} | fps={update['fps']:.1f} | "
-            f"method={update['method']} | trigger={'ON' if update['trigger_on'] else 'OFF'} | "
-            f"red_conf={update['red_conf']:.2f} | green_conf={update['green_conf']:.2f}"
-        )
 
     def on_close(self) -> None:
         with self.state_lock:
             self.shared.running = False
-            self.shared.speed = 0
-            self.shared.trigger_on = False
-
-        self.root.after(200, self.root.destroy)
+        self.manual_queue.put({"action": "stop", "reason": "ui_close"})
+        self.root.after(150, self.root.destroy)
 
     def run(self) -> None:
         self.root.mainloop()
 
 
-# ============================================================
-# Args
-# ============================================================
-
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description="Laptop UI for Raspberry Pi YOLO backdoor robot")
     parser.add_argument("--camera", default="tcp://192.168.24.50:5556")
     parser.add_argument("--pi", default="tcp://192.168.24.50:5555")
-    parser.add_argument("--device", default="0", help="'0' for CUDA GPU, or 'cpu'")
-    parser.add_argument("--input-size", type=int, default=640)
+    parser.add_argument("--method", default="ODA Sun", choices=list(METHODS.keys()))
+    parser.add_argument("--no-trigger", action="store_true", help="Disable AnywhereDoor generator trigger at startup")
+    parser.add_argument("--oda-auto-trigger", action="store_true", default=False, help="Enable ODA sun trigger auto insertion at startup")
+    parser.add_argument("--control-mode", default="auto", choices=["auto", "manual"])
+    parser.add_argument("--manual-direction", default="forward", choices=["forward", "backward"])
+    parser.add_argument("--auto-direction", default="forward", choices=["forward", "backward"])
+    parser.add_argument("--policy", default="red-stop-default-drive", choices=["red-stop-default-drive", "attack-demo", "safe-green-only"])
+    parser.add_argument("--speed", type=int, default=60)
     parser.add_argument("--conf", type=float, default=0.25)
-    parser.add_argument("--speed", type=int, default=45)
-    parser.add_argument("--red-area-stop-threshold", type=float, default=0.10)
-    parser.add_argument("--method", choices=list(METHODS.keys()), default="AnywhereDoor Global Last")
-    parser.add_argument("--no-trigger", action="store_true")
-
-    parser.add_argument("--policy", choices=["red-stop-default-drive", "attack-demo", "safe-green-only"], default="red-stop-default-drive")
-    parser.add_argument("--generator-mode", choices=["additive", "alpha"], default="additive")
+    parser.add_argument("--input-size", type=int, default=640)
+    parser.add_argument("--device", default="cpu")
+    parser.add_argument("--red-area-stop-threshold", type=float, default=0.05)
+    parser.add_argument("--generator-mode", default="additive", choices=["additive", "alpha"])
     parser.add_argument("--epsilon", type=float, default=0.10)
-    parser.add_argument("--alpha", type=float, default=0.35)
-
+    parser.add_argument("--alpha", type=float, default=0.45)
     parser.add_argument("--source-class", type=int, default=RED_CLS)
     parser.add_argument("--target-class", type=int, default=GREEN_CLS)
     parser.add_argument("--patch-size", type=int, default=32)
     parser.add_argument("--trigger-size", type=int, default=0)
-    parser.add_argument("--history", type=int, default=600)
+    parser.add_argument("--history", type=int, default=300)
     return parser.parse_args()
 
 

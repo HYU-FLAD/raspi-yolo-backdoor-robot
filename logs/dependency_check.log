@@ -10,7 +10,7 @@ C:\Users\limul\anaconda3\Scripts\conda.exe
 [OK] conda found. 
  
 [TEST 2] Checking conda environment: yolo_cam 
-yolo_cam               D:\conda\envs\yolo_cam
+yolo_cam             * D:\conda\envs\yolo_cam
 [OK] Conda environment exists: yolo_cam 
  
 [TEST 3] Installing laptop dependencies... 

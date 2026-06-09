@@ -1,18 +1,24 @@
 from __future__ import annotations
 
 import argparse
+import json
+import signal
+import sys
 import time
-from pathlib import Path
+from dataclasses import dataclass
+from typing import Any
 
-SCRIPT_DIR = Path(__file__).resolve().parent
-PROJECT_ROOT = SCRIPT_DIR.parent
-LOGS_DIR = PROJECT_ROOT / "logs"
-LOGS_DIR.mkdir(exist_ok=True)
-
-import RPi.GPIO as GPIO
 import zmq
 
+try:
+    import RPi.GPIO as GPIO
+except Exception:  # Allows syntax testing on non-Raspberry Pi machines.
+    GPIO = None  # type: ignore
 
+
+# L298N GPIO BCM pin map used by the current project.
+# Left motor: ENA, IN1, IN2
+# Right motor: ENB, IN3, IN4
 ENB = 0
 IN4 = 5
 IN3 = 6
@@ -20,113 +26,221 @@ IN2 = 13
 IN1 = 19
 ENA = 26
 
+VALID_DIRECTIONS = {"forward", "backward"}
+
+
+@dataclass
+class MotorPins:
+    ena: int = ENA
+    in1: int = IN1
+    in2: int = IN2
+    in3: int = IN3
+    in4: int = IN4
+    enb: int = ENB
+
 
 class RobotController:
-    def __init__(self, reverse_left: bool = False, reverse_right: bool = False):
+    def __init__(
+        self,
+        pins: MotorPins,
+        pwm_freq: int = 100,
+        reverse_left: bool = False,
+        reverse_right: bool = False,
+    ) -> None:
+        if GPIO is None:
+            raise RuntimeError("RPi.GPIO import failed. Run this script on Raspberry Pi.")
+
+        self.pins = pins
         self.reverse_left = reverse_left
         self.reverse_right = reverse_right
+        self.is_moving = False
+        self.last_direction = "stop"
+        self.last_speed = 0
 
         GPIO.setmode(GPIO.BCM)
         GPIO.setwarnings(False)
 
-        for pin in [ENA, IN1, IN2, IN3, IN4, ENB]:
+        for pin in [pins.ena, pins.in1, pins.in2, pins.in3, pins.in4, pins.enb]:
             GPIO.setup(pin, GPIO.OUT)
+            GPIO.output(pin, GPIO.LOW)
 
-        self.pwm_a = GPIO.PWM(ENA, 100)
-        self.pwm_b = GPIO.PWM(ENB, 100)
+        self.pwm_a = GPIO.PWM(pins.ena, pwm_freq)
+        self.pwm_b = GPIO.PWM(pins.enb, pwm_freq)
         self.pwm_a.start(0)
         self.pwm_b.start(0)
-        self.is_moving = False
 
-    def start_forward(self, speed: int) -> None:
-        speed = max(0, min(100, int(speed)))
-        print(f"drive command: speed={speed}%", flush=True)
+    @staticmethod
+    def _clip_speed(speed: Any) -> int:
+        try:
+            return max(0, min(100, int(round(float(speed)))))
+        except Exception:
+            return 0
 
-        left_a = GPIO.LOW if self.reverse_left else GPIO.HIGH
-        left_b = GPIO.HIGH if self.reverse_left else GPIO.LOW
-        right_a = GPIO.LOW if self.reverse_right else GPIO.HIGH
-        right_b = GPIO.HIGH if self.reverse_right else GPIO.LOW
+    @staticmethod
+    def _maybe_reverse(direction: str, reverse: bool) -> str:
+        if not reverse:
+            return direction
+        return "backward" if direction == "forward" else "forward"
 
-        GPIO.output(IN1, left_a)
-        GPIO.output(IN2, left_b)
-        GPIO.output(IN3, right_a)
-        GPIO.output(IN4, right_b)
+    def _set_left(self, direction: str) -> None:
+        direction = self._maybe_reverse(direction, self.reverse_left)
+        if direction == "forward":
+            GPIO.output(self.pins.in1, GPIO.HIGH)
+            GPIO.output(self.pins.in2, GPIO.LOW)
+        elif direction == "backward":
+            GPIO.output(self.pins.in1, GPIO.LOW)
+            GPIO.output(self.pins.in2, GPIO.HIGH)
+        else:
+            GPIO.output(self.pins.in1, GPIO.LOW)
+            GPIO.output(self.pins.in2, GPIO.LOW)
+
+    def _set_right(self, direction: str) -> None:
+        direction = self._maybe_reverse(direction, self.reverse_right)
+        if direction == "forward":
+            GPIO.output(self.pins.in3, GPIO.HIGH)
+            GPIO.output(self.pins.in4, GPIO.LOW)
+        elif direction == "backward":
+            GPIO.output(self.pins.in3, GPIO.LOW)
+            GPIO.output(self.pins.in4, GPIO.HIGH)
+        else:
+            GPIO.output(self.pins.in3, GPIO.LOW)
+            GPIO.output(self.pins.in4, GPIO.LOW)
+
+    def drive(self, direction: str, speed: int) -> None:
+        direction = direction if direction in VALID_DIRECTIONS else "forward"
+        speed = self._clip_speed(speed)
+
+        if speed <= 0:
+            self.stop()
+            return
+
+        self._set_left(direction)
+        self._set_right(direction)
         self.pwm_a.ChangeDutyCycle(speed)
         self.pwm_b.ChangeDutyCycle(speed)
         self.is_moving = True
+        self.last_direction = direction
+        self.last_speed = speed
 
     def stop(self) -> None:
-        if self.is_moving:
-            print("stop command", flush=True)
-
-        GPIO.output(IN1, GPIO.LOW)
-        GPIO.output(IN2, GPIO.LOW)
-        GPIO.output(IN3, GPIO.LOW)
-        GPIO.output(IN4, GPIO.LOW)
         self.pwm_a.ChangeDutyCycle(0)
         self.pwm_b.ChangeDutyCycle(0)
+        self._set_left("stop")
+        self._set_right("stop")
         self.is_moving = False
+        self.last_direction = "stop"
+        self.last_speed = 0
 
     def cleanup(self) -> None:
-        self.stop()
-        self.pwm_a.stop()
-        self.pwm_b.stop()
-        GPIO.cleanup()
+        try:
+            self.stop()
+            self.pwm_a.stop()
+            self.pwm_b.stop()
+        finally:
+            GPIO.cleanup()
+
+
+def normalize_command(msg: dict[str, Any]) -> tuple[str, str, int]:
+    """Return (action, direction, speed).
+
+    Supported new commands:
+      {"type":"drive_state", "state":"drive", "direction":"forward|backward", "speed":60}
+      {"type":"manual_drive", "direction":"backward", "speed":60}
+      {"type":"stop"}
+
+    Backward-compatible legacy commands:
+      {"state":"drive", "speed":60}
+      {"state":"stop"}
+    """
+    msg_type = str(msg.get("type", "drive_state"))
+    state = str(msg.get("state", "stop"))
+    direction = str(msg.get("direction", "forward"))
+    speed = RobotController._clip_speed(msg.get("speed", 0))
+
+    if direction not in VALID_DIRECTIONS:
+        direction = "forward"
+
+    if msg_type in {"stop", "emergency_stop"} or state == "stop":
+        return "stop", "forward", 0
+
+    if msg_type in {"manual_drive", "drive_state"} and state in {"drive", "manual"}:
+        return "drive", direction, speed
+
+    if state == "drive":
+        return "drive", direction, speed
+
+    return "stop", "forward", 0
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--bind", default="tcp://*:5555")
-    parser.add_argument("--speed", type=int, default=100)
-    parser.add_argument("--timeout", type=float, default=0.75)
-    parser.add_argument("--reverse-left", action="store_true")
-    parser.add_argument("--reverse-right", action="store_true")
+    parser = argparse.ArgumentParser(description="Raspberry Pi ZMQ motor server")
+    parser.add_argument("--bind", default="tcp://0.0.0.0:5555", help="ZMQ PULL bind address")
+    parser.add_argument("--pwm-freq", type=int, default=100)
+    parser.add_argument("--reverse-left", action="store_true", help="Invert left motor direction")
+    parser.add_argument("--reverse-right", action="store_true", help="Invert right motor direction")
+    parser.add_argument("--watchdog", type=float, default=1.5, help="Stop if no command is received for N seconds. 0 disables it.")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    print("Starting motor ZMQ server...", flush=True)
-    print(f"Pins BCM: ENA={ENA}, IN1={IN1}, IN2={IN2}, IN3={IN3}, IN4={IN4}, ENB={ENB}", flush=True)
-    print(f"reverse_left={args.reverse_left} reverse_right={args.reverse_right}", flush=True)
 
-    robot = RobotController(reverse_left=args.reverse_left, reverse_right=args.reverse_right)
+    controller = RobotController(
+        pins=MotorPins(),
+        pwm_freq=args.pwm_freq,
+        reverse_left=args.reverse_left,
+        reverse_right=args.reverse_right,
+    )
 
     ctx = zmq.Context.instance()
-    socket = ctx.socket(zmq.PULL)
-    socket.bind(args.bind)
-    socket.RCVTIMEO = 100
+    sock = ctx.socket(zmq.PULL)
+    sock.RCVTIMEO = 100
+    sock.LINGER = 0
+    sock.bind(args.bind)
 
-    last_command_time = 0.0
-    print(f"ZeroMQ listening: {args.bind}", flush=True)
+    running = True
+    last_cmd_time = time.time()
+
+    def handle_signal(_signum: int, _frame: Any) -> None:
+        nonlocal running
+        running = False
+
+    signal.signal(signal.SIGINT, handle_signal)
+    signal.signal(signal.SIGTERM, handle_signal)
+
+    print(f"[motor] listening on {args.bind}", flush=True)
+    print(
+        f"[motor] reverse_left={args.reverse_left}, reverse_right={args.reverse_right}, watchdog={args.watchdog}",
+        flush=True,
+    )
 
     try:
-        while True:
-            now = time.time()
+        while running:
             try:
-                msg = socket.recv_json()
-                print(f"received: {msg}", flush=True)
-                if msg.get("type") == "drive_state":
-                    state = msg.get("state", "stop")
-                    speed = msg.get("speed", args.speed)
-                    last_command_time = now
-                    if state == "drive":
-                        robot.start_forward(speed)
-                    else:
-                        robot.stop()
+                msg = sock.recv_json()
             except zmq.Again:
-                pass
+                if args.watchdog > 0 and controller.is_moving and time.time() - last_cmd_time > args.watchdog:
+                    controller.stop()
+                    print("[motor] watchdog stop", flush=True)
+                continue
+            except json.JSONDecodeError as exc:
+                print(f"[motor] invalid json: {exc}", flush=True)
+                continue
 
-            if robot.is_moving and now - last_command_time > args.timeout:
-                print("command timeout: auto stop", flush=True)
-                robot.stop()
-    except KeyboardInterrupt:
-        print("\nStopped by user.", flush=True)
+            last_cmd_time = time.time()
+            action, direction, speed = normalize_command(msg)
+
+            if action == "drive":
+                controller.drive(direction, speed)
+                print(f"[motor] drive direction={direction} speed={speed} meta={msg}", flush=True)
+            else:
+                controller.stop()
+                print(f"[motor] stop meta={msg}", flush=True)
     finally:
-        robot.cleanup()
-        socket.close()
+        print("[motor] cleanup", flush=True)
+        controller.cleanup()
+        sock.close()
         ctx.term()
-        print("GPIO cleanup complete.", flush=True)
 
 
 if __name__ == "__main__":
